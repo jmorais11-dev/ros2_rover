@@ -1,0 +1,1418 @@
+# ROS2 Rover
+
+> Documentação sobre o desenvolvimento da navegação autônoma (Nav2) do rover da equipe ARES
+
+--------------------------------------------------------------------------------
+title: "Home"
+url: https://blazemorales.github.io/rover_circ_ares/index.md
+--------------------------------------------------------------------------------
+<no value>
+
+--------------------------------------------------------------------------------
+title: "Pages"
+url: https://blazemorales.github.io/rover_circ_ares/pages/index.md
+--------------------------------------------------------------------------------
+<no value>
+
+--------------------------------------------------------------------------------
+title: "Auditoria de Prontidão — Lançamento e Bancada"
+url: https://blazemorales.github.io/rover_circ_ares/auditoria-prontidao/index.md
+description: O que falta no repositório para ligar o rover real com segurança e para os testes de bancada, comparado aos requisitos do CIRC.
+--------------------------------------------------------------------------------
+
+{{< toc >}}
+
+Auditoria feita em **16/11/2026** sobre o `main` do repositório. Ela responde a duas
+perguntas:
+
+1. **Lançamento:** dá para ligar, inicializar e operar o rover real de forma segura e
+   reproduzível?
+2. **Bancada:** dá para testar cada subsistema sozinho e depois todos juntos, antes de
+   ir para o campo?
+
+Melhorias gerais de arquitetura e as funções específicas das provas ficam de fora; elas já
+estão no [checklist de requisitos](/requisitos-circ).
+
+{{< notice "warning" >}}
+**Respostas pendentes da equipe:** seis perguntas sobre hardware e decisões travam o
+começo do trabalho. Respondam na issue
+[#32](https://github.com/Blazemorales/rover_circ_ares/issues/32) (resumo na
+[seção 6](#6-perguntas-para-a-equipe)).
+{{< /notice >}}
+
+## Resumo para toda a equipe
+
+- **A simulação está pronta; o rover real, não.** O código compila do zero (CI do Docker
+  verde), mas o caminho que liga os motores de verdade tem falhas de segurança.
+- **O mais grave:** se o comando parar de chegar, ou se o programa for encerrado, **os
+  motores continuam girando** com o último comando recebido. Nada no software os para.
+- **Também bloqueia:** duas peças de hardware disputam a mesma porta USB, e o boot
+  automático não é reproduzível.
+- **A boa notícia:** os bloqueios de software são pequenos (dias, não semanas). O que
+  falta para começar são **respostas de Elétrica e Embarcados** sobre o hardware.
+- **Regra até lá:** motores só com **rodas suspensas** e com alguém na mão do **kill
+  switch físico**.
+
+### O que cada área precisa fazer
+
+| Área | Pedido | Pergunta |
+|---|---|---|
+| Elétrica | Confirmar que o kill switch e os fusíveis existem e cortam a energia **dos servos** | 4 |
+| Embarcados | Dizer qual controlador de motor e qual computador vão para a bancada | 1 |
+| Embarcados / Telecom | Listar os sensores que existem fisicamente e como se ligam (serial, USB, ethernet) | 2 |
+| Embarcados / Software | Aprovar o timeout do watchdog (proposta: 0,5 s) e testar o LX-16A sem comando | 5, 6 |
+| Software | Decidir se o boot roda no host ou em Docker; depois, executar a [sequência](#5-sequência-de-ações) | 3 |
+
+## 1. De onde vêm os requisitos
+
+A base é o documento **Levantamento Inicial CIRC v2 (05/11/2026)**, que resume o
+regulamento do CIRC 2027: [R3] regras, [R4] provas, [R5] segurança do rover. Ele é um
+**resumo da equipe**, não o regulamento oficial; as páginas oficiais não foram
+relidas nesta auditoria.
+
+Itens marcados com **[I]** são **inferência nossa** (boa prática para um rover operado à
+distância), não regra escrita.
+
+**Legenda de status:**
+**✅ Atendido** · **🟡 Parcial** · **❌ Ausente** · **❔ Não verificável** pelo
+repositório (depende de hardware ou de documento externo).
+
+## 2. Lançamento: ligar, inicializar e operar com segurança
+
+| # | Requisito (fonte) | Status | Evidência |
+|---|---|---|---|
+| L1 | Kill switch físico, vermelho, iluminado, no topo, independente de computador [R5] | ❔ | É hardware. Nada no repositório confirma que existe. |
+| L2 | Fusível ou disjuntor; proteção por software não vale [R5] | ❔ | É hardware. |
+| L3 | 1 h só com bateria de bordo; bateria e BMS comerciais [R3][R5] | ❔ | Não há orçamento de energia ([#25](https://github.com/Blazemorales/rover_circ_ares/issues/25)). |
+| L4 | Parar os motores quando o comando some (watchdog, perda de link) [R5 recomendado] | ❌ | `controller_node.cpp` só escreve nos servos quando chega mensagem; não há timer nem timeout. O último comando vale para sempre. |
+| L5 | Parar os motores ao encerrar o programa (Ctrl+C, `systemctl stop`, falha) [I] | ❌ | `ControllerNode::shutdown()` chama `kill_motors()`, mas **ninguém chama** `shutdown()`: `controller_node_main.cpp` só faz `spin` e `rclcpp::shutdown()`. |
+| L6 | Limitar os comandos de motor [I] | ❌ | `vel_parser_node.cpp` limita só o lado positivo (`std::min`). Com `linear.x = -3`, o duty vai a −3000; a faixa do LX-16A é ±1000. |
+| L7 | Validar mensagens de motor [I] | ❌ | `motor_controller.cpp` lê `corner_ticks[0..3]` e `drive_ticks[0..5]` sem conferir o tamanho. Um `ros2 topic pub` errado na bancada lê memória fora do vetor. |
+| L8 | Verificação automática na partida (montagem em 15 min) [R3] | 🟡 | `controller_node.cpp` confere se o device existe e tem permissão. Mas `lx16a.cpp:39` ignora o retorno de `connect()` e ninguém verifica se os servos respondem. |
+| L9 | Portas seriais estáveis [I] | ❌ | `urg_node_serial.yaml` e `ublox.yaml` usam **ambos** `/dev/ttyACM0`; servos em `/dev/ttyUSB0`. Sem regras udev, quem abre o quê depende da ordem em que o USB enumera. |
+| L10 | Boot reproduzível (systemd) | 🟡 | `ros2/rover_service/` existe, mas: `After=network.service` em vez de `network-online.target`; sem `Restart=on-failure`; sem `ROS_DOMAIN_ID`. Assume ROS no host, contra o README (ROS só em Docker). `install.sh` usa caminhos relativos e instala 3 pacotes à mão em vez de `rosdep`. |
+| L11 | Botão de habilitação no joystick (deadman) | 🟡 | `ps3.yaml`: `enable_button: 8` (L2); soltar o botão manda velocidade zero. Não protege se o joystick ou o nó cair no meio do comando (ver L4). |
+| L12 | Modos desarmado / manual / autônomo [I] | ❌ | Não existe gerente de modos ([#18](https://github.com/Blazemorales/rover_circ_ares/issues/18)). Os motores aceitam comando assim que o nó sobe. |
+
+## 3. Bancada: testar subsistemas sozinhos e juntos
+
+| # | Requisito | Status | Evidência |
+|---|---|---|---|
+| B1 | Workspace compila a partir de máquina limpa | ✅ | `Dockerfile` e o workflow *Docker Build*, verde no `main`. |
+| B2 | Testar a cinemática sem hardware | 🟡 | A simulação usa o mesmo `vel_parser_node` do rover real (`rover_gazebo/launch/include/cmd_vel.launch.py`). Mas o `controller_node` aborta se não houver serial: não há modo "sem hardware". |
+| B3 | Testes automáticos do caminho até os motores | ❌ | O workflow *Tests* só roda para `tools/**` (política do MCP). Não há teste do `vel_parser` nem do protocolo LX-16A. |
+| B4 | Drivers de sensores e TF do rover real | 🟡 | `rover.launch.py` sobe só `urg_node`, joystick e motores. Falta `robot_state_publisher` (sem TF `base_link→laser`), IMU e câmera. `ublox.launch.py` existe mas não é incluído, `ublox_gps` não está no `package.xml` e o `ublox.yaml` está em `tmode3: 1` (modo **estação base** RTK). |
+| B5 | Telemetria de saúde: tensão e temperatura [R5 recomendado] | ❌ | O LX-16A já oferece leitura de temperatura e tensão (`SERVO_TEMP_READ`, `SERVO_VIN_READ` em `lx16a_consts.hpp`), mas nada é publicado. |
+| B6 | Estação e rover separados por rede (operador não vê o rover) [R3] | ❌ | O joystick roda **no rover** (`joy_linux` em `rover.launch.py`). Não há launch da estação, IPs fixos nem `ROS_DOMAIN_ID` ([#19](https://github.com/Blazemorales/rover_circ_ares/issues/19)). |
+| B7 | Calibração da direção e da geometria | 🟡 | `enc_min=250`, `enc_max=750` e `hardware_distances` são os valores do Sawppy original. Não há procedimento para medi-los no nosso chassi. |
+| B8 | Gravação de dados (rosbag) | ❌ | [#20](https://github.com/Blazemorales/rover_circ_ares/issues/20). |
+| B9 | Roteiro de bancada escrito | ❌ | No README, "Rover real" é um único comando. Não há passo a passo nem critério de aprovado/reprovado. |
+
+## 4. Lacunas
+
+### Bloqueantes
+
+Impedem ligar o rover com segurança ou começar a bancada:
+
+1. **L4 + L5:** o rover não para sozinho, nem quando o comando some nem quando o programa
+   é encerrado. **Item mais grave.**
+2. **L6 + L7:** comando sem limite e mensagem sem validação. Poucas linhas de correção;
+   precisam estar prontas antes de alguém publicar comandos à mão.
+3. **L9:** duas peças na mesma porta e nenhuma regra udev. O boot fica imprevisível.
+4. **L10:** escolher e consertar um único caminho de boot (host ou Docker).
+5. **L1 e L2:** confirmação de Elétrica de que kill switch e fusíveis existem e cortam a
+   energia dos servos.
+6. **B4 e B6:** bloqueiam a bancada **integrada** (sensores e estação), não a bancada só
+   de motores.
+
+### Importantes, mas não bloqueantes
+
+L8 (verificação completa na partida), L12 (modos), B2 e B3 (modo sem hardware, testes no
+CI), B5 (telemetria), B7 (calibração), B8 (rosbag), B9 (roteiro) e todos os itens de
+prova do [checklist de requisitos](/requisitos-circ): GNSS, ArUco, UI do juiz, rádio,
+braço, interfaces TRS.
+
+## 5. Sequência de ações
+
+A ordem segue as dependências: cada passo deixa o seguinte mais seguro ou possível.
+
+{{< mermaid >}}
+flowchart TD
+  P1["1. Respostas da equipe<br/>issue #32"] --> P4["4. udev e portas"]
+  P2["2. Segurança dos motores<br/>watchdog, parada, limites"] --> P3["3. Modo sem hardware<br/>e testes no CI"]
+  P2 --> P6
+  P4 --> P5["5. Boot único e<br/>verificação na partida"]
+  P3 --> P6["6. Bancada de motores<br/>rodas suspensas"]
+  P5 --> P6
+  P6 --> P7["7. Rede estação ↔ rover<br/>teste de queda de link"]
+  P7 --> P8["8. Sensores, TF, rosbag,<br/>telemetria, roteiro"]
+{{< /mermaid >}}
+
+1. **Responder às perguntas da [#32](https://github.com/Blazemorales/rover_circ_ares/issues/32).**
+   Elas dizem quais portas, drivers e computador existem; todo o resto depende disso.
+2. **Segurança dos motores** (L4–L7): timer que zera os motores sem comando novo por N ms;
+   `kill_motors()` ao encerrar; validar o tamanho das mensagens; checar o `connect()`;
+   limitar a velocidade dos dois lados e o duty a ±1000. Não depende de nada e reduz o
+   risco de todo teste seguinte.
+3. **Modo sem hardware e testes** (B2, B3): serial simulada ou opção `dry_run`, mais
+   testes do `vel_parser` e do watchdog no CI. Valida o passo 2 sem ligar nada.
+4. **Regras udev e portas por parâmetro** (L9). Vem antes do boot automático, que precisa
+   de nomes estáveis.
+5. **Boot único** (L10, L8 básico): um só caminho, serviço com `network-online.target`,
+   `Restart=on-failure` e variáveis de ambiente; verificação na partida que conversa com
+   cada servo e lê a tensão, com o resultado no log.
+6. **Primeira bancada de motores**, rodas suspensas, kill switch confirmado: centralizar a
+   direção, calibrar (B7) e cronometrar a parada ao matar o teleop.
+7. **Rede estação ↔ rover** (B6): IPs fixos, `ROS_DOMAIN_ID`, joystick na estação e teste
+   de queda de link (cabo desligado ou `tc netem`) para ver o watchdog agir.
+8. **Sensores e TF** (B4) com o hardware que existir; depois rosbag (B8), telemetria
+   (B5) e o roteiro de bancada escrito (B9).
+
+## 6. Perguntas para a equipe
+
+Respondam na issue [#32](https://github.com/Blazemorales/rover_circ_ares/issues/32),
+citando o número da pergunta. Esta página será atualizada com as respostas.
+
+| # | Pergunta | Quem responde | Resposta |
+|---|---|---|---|
+| 1 | O "rover menor remontado" usa servos LX-16A (o único hardware que o código suporta)? Qual é o computador de bordo e o sistema? | Embarcados, Estruturas | *pendente* |
+| 2 | Quais sensores existem: Hokuyo serial ou ethernet? IMU (modelo)? A câmera Xtion do modelo é real? O u-blox é do rover ou é estação base RTK? | Embarcados, Telecom | *pendente* |
+| 3 | O boot roda com ROS no host (como o `rover.service` assume) ou em Docker (como o README diz)? | Software | *pendente* |
+| 4 | Kill switch e fusíveis já existem? O kill switch corta a energia dos servos? | Elétrica | *pendente* |
+| 5 | Timeout do watchdog de 0,5 s está aceitável? | Software, Embarcados | *pendente* |
+| 6 | Na bancada, com rodas suspensas: o LX-16A em modo motor mantém o último comando para sempre? | Bancada | *pendente* |
+
+
+--------------------------------------------------------------------------------
+title: "Chat Web — Comandar o Rover por um Link"
+url: https://blazemorales.github.io/rover_circ_ares/chat-web/index.md
+description: Página pública (Render) onde um LLM gratuito (Groq) comanda o rover simulado no PC, através de um agente local que mantém a camada de segurança.
+--------------------------------------------------------------------------------
+
+{{< toc >}}
+
+```
+navegador ──ws /chat──▶ server.py (Render, grátis) ──HTTPS──▶ LLM (Groq, grátis)
+                             ▲
+                             │ ws /agent  (conexão de SAÍDA, aberta pelo PC)
+                             │
+                        agent.py (PC) ─▶ rover_mcp_safe ─▶ rosbridge :9090 ─▶ ROS 2 / Gazebo
+```
+
+O PC fica atrás do roteador, então o site não consegue chamar o PC. Por isso
+quem abre a conexão é o **agente no PC**. Nenhuma porta do PC fica exposta na
+internet, e a política de segurança (`rover_mcp_safe`) continua rodando no PC:
+mesmo que o site fosse comprometido, ele só conseguiria pedir as 5 tools
+abaixo, nunca `/cmd_vel`.
+
+## As 5 tools dedicadas
+
+Elas substituem as tools genéricas do ros-mcp que confundiam o modelo (ver
+[ROS-MCP](/ros-mcp), seção "Falhas do teste com LLM").
+
+| Tool | O que faz |
+|---|---|
+| `navigate_to(x, y, yaw_deg, timeout_s)` | pausa o explore, manda o goal ao Nav2, **espera o fim** e responde `ARRIVED` / `ABORTED` / `CANCELED` / `TIMEOUT`, com a posição final e a distância até o alvo. Recusa alvos a mais de 30 m. |
+| `run_mission(steps, on_failure)` | executa até 12 passos em ordem (`go_to`, `move_forward`, `wait`, `return_to_base`) e responde `MISSION COMPLETE` ou `MISSION FAILED` com uma linha por passo. Para no primeiro passo que falhar (ou volta para a base com `on_failure="return_to_base"`). O `stop_navigation` interrompe a missão. |
+| `stop_navigation()` | pausa o explore e cancela **todos** os goals do Nav2, inclusive os do `explore_lite` |
+| `set_exploration(enabled)` | liga/desliga o `explore_lite` |
+| `get_robot_pose()` | posição no frame `map`, calculada pelo `/tf` (map→odom→base_link) |
+
+Os perfis do `rover_mcp_safe.py` (`--profile` ou `ROVER_MCP_PROFILE`) são:
+
+- `nav` (padrão): as 5 tools mais as de leitura.
+- `minimal`: só as 5 tools. É o perfil usado pelo chat web.
+- `full`: inclui as escritas genéricas antigas, só para depuração.
+
+O botão **PARAR** da página chama `stop_navigation` direto, sem passar pelo LLM,
+e funciona mesmo enquanto um `navigate_to` está esperando.
+
+## Montar (uma vez)
+
+1. **Chave grátis do Groq:** crie uma conta em console.groq.com → *API Keys* →
+   *Create API Key*. Não pede cartão. O modelo padrão é o `openai/gpt-oss-120b` (o `llama-3.3-70b-versatile` foi desligado pelo Groq em 16/08/2026).
+   Para trocar de provedor, mude `LLM_BASE_URL`/`LLM_MODEL` (qualquer API compatível
+   com OpenAI serve, por exemplo Gemini ou OpenRouter).
+2. **Render:** crie uma conta em render.com com o GitHub → *New* → *Blueprint* →
+   escolha o repositório `ros2_nav2`. O `render.yaml` da raiz cria o serviço
+   `rover-chat` (plano free). Ele pede:
+   - `LLM_API_KEY`: a chave do Groq;
+   - `CHAT_PASSWORD`: a senha da página (invente uma);
+   - `AGENT_TOKEN`: é gerado automaticamente. Copie em *Environment* para usar no PC.
+3. A URL fica algo como `https://rover-chat-xxxx.onrender.com`.
+
+## Usar (toda vez)
+
+```bash
+# 1) simulação (container) — explore:=false para a IA comandar sem disputa
+docker start rover_mcp
+docker exec -it rover_mcp bash
+ros2 launch rover_bringup rover_mcp_sim.launch.py \
+  slam:=true explore:=false headless:=true launch_rviz:=false sim_lite:=true
+
+# 2) agente (host, outro terminal) — espere o /odom existir (~1 min)
+cd ~/Documentos/ros2_nav2
+~/.local/share/pipx/venvs/ros-mcp/bin/python -I tools/rover_web/agent.py \
+  --server wss://rover-chat-xxxx.onrender.com --token 'COLE_O_AGENT_TOKEN'
+# deve imprimir: connected to wss://... with tools: get_robot_pose, navigate_to, ...
+```
+
+Depois abra a URL no navegador (funciona no celular também), digite a senha e
+mande ordens: "onde você está?", "vá para x=2, y=0", "ative a exploração", "pare".
+
+Para parar tudo: `docker stop rover_mcp`.
+
+### Com a interface gráfica (Gazebo + RViz)
+
+Para ver o rover se mover enquanto conversa com ele, troque o passo 1 por:
+
+```bash
+xhost +SI:localuser:root          # libera o X para o root do container (vale até deslogar)
+docker start rover_mcp
+docker exec -it -e DISPLAY=:1 -e QT_X11_NO_MITSHM=1 rover_mcp bash
+source /opt/ros/jazzy/setup.bash && source /root/ros2_ws/install/setup.bash
+ros2 launch rover_bringup rover_mcp_sim.launch.py \
+  slam:=true explore:=false headless:=false launch_rviz:=true sim_lite:=true
+```
+
+O container usa `--net=host`, então ele alcança o socket do X do desktop sem
+montar `/tmp/.X11-unix`. Confira o número do display com `echo $DISPLAY` no host
+(aqui é `:1`). Sem GPU, o Gazebo renderiza pela CPU, e a simulação fica mais
+lenta que no modo headless. Se pesar demais, use `headless:=true launch_rviz:=true`:
+o RViz é bem mais leve e já mostra o mapa, a pose e o caminho do Nav2. Se a janela
+do Gazebo ficar preta, entre no container também com `-e LIBGL_ALWAYS_SOFTWARE=1`.
+
+## Teste local, sem Render
+
+```bash
+PY=~/.local/share/pipx/venvs/ros-mcp/bin/python
+LLM_API_KEY=... AGENT_TOKEN=t CHAT_PASSWORD=p $PY -I tools/rover_web/server.py   # http://localhost:8000
+$PY -I tools/rover_web/agent.py --server ws://127.0.0.1:8000 --token t
+```
+
+Sem chave do Groq, dá para usar o Ollama local, que tem API compatível:
+`LLM_BASE_URL=http://127.0.0.1:11434/v1 LLM_MODEL=llama3.2 LLM_API_KEY=x`.
+Sem GPU, porém, ele leva cerca de 1,5 min por resposta.
+
+## Limites e armadilhas
+
+- **O Render free dorme** depois de cerca de 15 min sem acesso, e acordar leva
+  cerca de 1 min. O agente faz um ping a cada 10 min e se reconecta sozinho, com
+  espera crescente.
+- **A cota do Groq free** é limitada por minuto e por dia. Se estourar, a página
+  mostra "the free LLM quota is exhausted". Espere e tente de novo.
+- **Um agente por vez:** um agente novo derruba o anterior.
+- **Uma simulação por vez.** Duas simulações ao mesmo tempo (por exemplo, uma
+  headless esquecida e uma nova com GUI) publicam no mesmo `/clock`. O tempo da
+  simulação "volta" (`Detected jump back in time` no log), e o EKF
+  (`robot_localization`) diverge para NaN, sem se recuperar. As tools passam a
+  responder `LOCALIZATION BROKEN`, e o LLM avisa que é preciso reiniciar a
+  simulação. A solução é `docker restart rover_mcp`, que mata tudo, e subir uma
+  única simulação. Para conferir antes de lançar: `docker exec rover_mcp pgrep -a gz`.
+- **Reinicie o `agent.py` depois de atualizar o código.** Ele carrega o
+  `rover_mcp_safe` só ao iniciar.
+- **`model_not_found` (404) no chat** quase sempre é erro de digitação em
+  `LLM_MODEL` no dashboard do Render (por exemplo, um ponto final colado junto:
+  `openai/gpt-oss-120b.`). O valor do dashboard tem prioridade sobre o padrão do
+  código. Confira em `/health`, no campo `model`.
+- **Distâncias longas demoram.** A simulação roda a ~0,4× o tempo real: 6 m
+  levam cerca de 1,5 min, e 10 m passam de 5 min. O `navigate_to` espera até
+  600 s por padrão (`ROVER_MCP_NAV_TIMEOUT`).
+
+## Navegação no terreno lunar (perfil `uneven_terrain`)
+
+O `moon.world` é só um heightmap, sem pedras. O lidar 2D fica a ~0,21 m do
+chão, então qualquer rampa suave à frente (~2,4° a 5 m) virava "parede" no
+`/map` do SLAM, e o Nav2 planejava em cima disso. O resultado eram abortos com
+"Start occupied" (o rover passava por cima de uma parede fantasma) e
+"exceeded maximum iterations".
+
+Correções (`rover_navigation/launch/bringup.launch.py`, `rover_bt.xml`):
+
+- **Costmap global feito pelo `/scan`**, e não pelo `/map`. O raytracing vai
+  até 5 m (`inf` conta como livre), mas só retornos a **menos de 0,8 m**
+  (~15° de inclinação) viram obstáculo. A área sob o rover é sempre limpa. O
+  SLAM continua só para localização.
+- **Costmap local de 6×6 m.** O RPP só segue os pontos do caminho dentro dele;
+  com 3×3 m, um desvio de 1,5 m gerava "Resulting plan has 0 poses".
+- **Behavior tree:** replaneja a cada 3 s a partir da pose atual e faz até 4
+  novas tentativas, limpando os costmaps e esperando. Sem BackUp/Spin.
+- O perfil vem ligado por padrão no `gazebo.launch.py` e no `rover_mcp_sim.launch.py`
+  (`uneven_terrain:=false` desliga). No `bringup.launch.py`, usado pelo
+  robô real, o padrão é `false`, porque lá as paredes existem.
+
+Bateria de 7 goals (quadrado de 3 m, volta à origem, 6 m e 10 m):
+
+| Configuração | Chegaram | Falhas |
+|---|---|---|
+| original | ~1 | "Start occupied", "max iterations" |
+| + costmap global pelo `/scan` | 4/7 | "plan has 0 poses" (controller) |
+| + BT com replanejamento + costmap local 6 m | **6/7** | 1 timeout a 0,9 m do alvo de 10 m (limite antigo de 300 s) |
+
+## Validação (2026-11-12)
+
+| Teste | Resultado |
+|---|---|
+| `navigate_to(2, 0)` a partir da origem | ✅ `ARRIVED` (28 s; 0,49 m do alvo, dentro da tolerância do Nav2) |
+| `navigate_to(6, 0)` + `stop_navigation` após 20 s | ✅ `STOPPED` (1 goal cancelado) e o `navigate_to` respondeu `CANCELED` |
+| Goal com o rover sobre um "obstáculo" fantasma (antes do perfil de terreno) | ✅ `ABORTED`, sem afirmar que chegou |
+| `get_robot_pose` com o rover parado | ✅ 0,1 s, frame `map` (o `/pose` do slam_toolbox fica mudo nessa situação) |
+| Agente com token errado | ✅ recusado (HTTP 403), o agente sai |
+| Chat com senha errada | ✅ "senha incorreta" |
+| Chat → LLM (Ollama llama3.2, local) → `get_robot_pose` → resposta | ✅ ponta a ponta |
+| Botão PARAR | ✅ chama `stop_navigation` direto, sem passar pelo LLM |
+| Missão "ande 3 m, espere 3 s, volte para a base" | ✅ `MISSION COMPLETE` em 215 s (andou 2,5 m: tolerância de 0,5 m do Nav2) |
+| Missão cancelada com `stop_navigation` no meio | ✅ `MISSION FAILED`, passo 1 `CANCELED`, os demais não rodaram |
+| Fluxo com Groq + Render reais | ⏳ falta a chave/conta do usuário |
+
+
+--------------------------------------------------------------------------------
+title: "Comandos Essenciais — Simulação Gazebo do Rover"
+url: https://blazemorales.github.io/rover_circ_ares/comandos-essenciais-simulacao/index.md
+description: Passo a passo completo, sequencial e testado para compilar e rodar a simulação do rover Sawppy no Gazebo (mundos Moon/Mars/Forest), com SLAM e exploração autônoma.
+--------------------------------------------------------------------------------
+
+{{< toc >}}
+
+Guia sequencial para sair do zero até o rover explorando sozinho no Gazebo.
+Baseado no repositório [`ros2_rover`](https://github.com/mgonzs13/ros2_rover)
+(fork `aresunbrovers/ros2_rover`, branch `jazzy`).
+
+## Pré-requisitos
+
+- **Docker** instalado no host. Todo o ROS 2 roda dentro do container — **não
+  instale ROS 2 / colcon direto no host**, o `Dockerfile` da raiz do repo já
+  cuida disso a partir da imagem `ros:jazzy` (que traz Gazebo Harmonic via
+  `ros_gz_sim`).
+- **Servidor X11** no host, só se você quiser a GUI do Gazebo. Sem isso, use
+  o modo `headless` (ver seção 5).
+- O repositório clonado na raiz, onde está o `Dockerfile`.
+
+## 1. Build da imagem Docker
+
+```shell
+cd rover_circ_ares   # raiz do repo, onde está o Dockerfile
+docker build -t rover .
+```
+
+O que esse `Dockerfile` faz por baixo:
+
+1. Parte de `ros:jazzy` e copia o repositório para `/root/ros2_ws/src`.
+2. Instala dependências de sistema (`gcc`, `git`, `wget`, `python3`, `python3-pip`).
+3. Roda `rosdep install --from-paths src --ignore-src -r -y` para instalar
+   todas as dependências ROS declaradas nos `package.xml` de cada pacote
+   (inclui `ros2controlcli`, `gz_ros2_control`, `ros_gz_sim`, `ros_gz_bridge`,
+   `controller_manager`, `rviz2`, etc.).
+4. Compila o workspace inteiro com `colcon build`.
+5. Deixa `source /root/ros2_ws/install/setup.bash` já no `~/.bashrc` do container.
+
+## 2. Subir o container
+
+**Uso rápido/efêmero** (some ao sair, bom pra testar a imagem):
+
+```shell
+docker run -it --rm rover
+```
+
+**Uso de desenvolvimento** (monta o repo do host dentro do container e
+habilita a GUI do Gazebo via X11):
+
+```shell
+xhost +local:docker   # autoriza o container a abrir janelas no X11 do host
+                       # (não persiste entre reboots do host — repita se a GUI
+                       # falhar com "Authorization required, but no authorization
+                       # protocol specified")
+
+docker run -it --name rover_dev \
+  -v $(pwd):/workspaces/ros2_ws \
+  -e DISPLAY=$DISPLAY \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  rover bash
+```
+
+Container já criado antes? Só reabrir:
+
+```shell
+docker start rover_dev
+docker exec -it rover_dev bash
+```
+
+## 3. Compilar o workspace (dentro do container)
+
+```shell
+cd /root/ros2_ws          # ou /workspaces/ros2_ws se você montou o volume
+rosdep install --from-paths src --ignore-src -r -y
+colcon build
+source install/setup.bash
+```
+
+## 4. Rodar o rover real (bringup, sem simulação)
+
+```shell
+ros2 launch rover_bringup rover.launch.py
+```
+
+## 5. Rodar a simulação no Gazebo
+
+Três mundos prontos:
+
+```shell
+ros2 launch rover_gazebo moon.launch.py
+ros2 launch rover_gazebo mars.launch.py
+ros2 launch rover_gazebo forest.launch.py
+```
+
+### Argumentos úteis (`moon.launch.py`)
+
+| Argumento          | Default      | Descrição                                                                  |
+| ------------------ | ------------ | --------------------------------------------------------------------------- |
+| `headless`          | `False`      | roda `gz sim -s` (servidor apenas, sem GUI) — evita gastar CPU renderizando |
+| `slam`              | `True`       | sobe o `slam_toolbox` (mapeamento)                                          |
+| `explore`           | `True`       | sobe o `explore_lite` (exploração autônoma via Nav2, frontier exploration)  |
+| `launch_rviz`       | `True`       | abre o RViz2                                                                |
+| `nav2_planner`      | `SmacHybrid` | `SmacHybrid` ou `SmacLattice`                                               |
+| `nav2_controller`   | `RPP`        | `RPP` ou `TEB`                                                              |
+
+Exemplo — exploração autônoma completa, sem gastar recursos com a GUI (bom
+para testar rápido ou rodar em CI):
+
+```shell
+ros2 launch rover_gazebo moon.launch.py slam:=True explore:=True headless:=True
+```
+
+Ver detalhes de como esse fluxo de SLAM + exploração + Nav2 foi validado (e
+os bugs corrigidos no caminho) no [Diário de Bordo](/diario-de-bordo).
+
+## 6. Serviço Linux (opcional, produção/boot automático)
+
+```shell
+cd ~/ros2_ws/src/rover_circ_ares/ros2/rover_service
+sudo ./install.sh
+sudo service rover status
+```
+
+## Limpando processos travados
+
+Dentro do container, evite `pkill -f` com padrões genéricos como `ros2`: eles
+casam com a própria linha de comando do `docker exec bash -c "..."` (que
+contém `/ros2_ws/`) e podem matar o processo errado — inclusive o PID 1 do
+container. Prefira matar por PID:
+
+```shell
+ps -eo pid=,comm= | awk '$1 != 1 {print $1}' | xargs -r kill
+```
+
+## Dependências externas
+
+| Dependência | Onde é usada | Como é resolvida |
+| --- | --- | --- |
+| Docker | build/execução de tudo | instalar manualmente no host |
+| ROS 2 Jazzy | base do workspace | vem na imagem `ros:jazzy` do Dockerfile |
+| Gazebo Harmonic | simulação 3D | trazido pelas dependências `ros_gz_sim` / `ros_gz_bridge` via rosdep |
+| `gz_ros2_control` | controllers do rover na simulação | rosdep, declarado em `ros2/rover_gazebo/package.xml` |
+| `ros2controlcli` | ativa os controllers (`ros2 control load_controller ...`) | rosdep, declarado em `ros2/rover_gazebo/package.xml` |
+| `slam_toolbox` | mapeamento (SLAM) | pacote `rover_slam` |
+| `explore_lite` (fork `robo-friends/m-explore-ros2`) | exploração autônoma de fronteiras | pacote `rover_slam` |
+| Nav2 (`SmacHybrid`/`SmacLattice` + `RPP`/`TEB`) | navegação/desvio de obstáculos | pacote `rover_navigation`, já existente no repo upstream |
+| X11 (`xhost`) | GUI do Gazebo dentro do container | só necessário se `headless:=False` |
+
+
+--------------------------------------------------------------------------------
+title: "Desempenho da Simulação — RTF do Gazebo"
+url: https://blazemorales.github.io/rover_circ_ares/desempenho-simulacao/index.md
+description: Por que a simulação do rover rodava a 18% do tempo real, como o gargalo foi isolado e o perfil leve sim_lite que dobra o RTF.
+--------------------------------------------------------------------------------
+
+{{< toc >}}
+
+O Gazebo rodava a **~0,18 do tempo real** (RTF) com a stack completa
+(Gazebo + EKF + slam_toolbox + Nav2). Cada segundo simulado levava ~5,5 s de
+relógio: o Nav2 perdia a taxa de controle e um teste com LLM levava minutos
+por rodada. Esta página registra o diagnóstico e o perfil leve `sim_lite`.
+
+## Resumo
+
+| | RTF |
+|---|---|
+| Perfil original (câmera 720×480 @ 30 Hz + nuvem de pontos) | **0,18** |
+| `sim_lite:=true` (320×240 @ 10 Hz, sem nuvem) | **0,42** (2,3×) |
+| `sim_lite:=true camera_rate:=5` | **0,51** |
+
+A meta inicial era RTF ≥ 0,6. **Não foi atingida só pela câmera**: mesmo a
+2 Hz o RTF parou em 0,63, então o resto é custo fixo (física do rocker-bogie
+e o `gpu_lidar`).
+
+```bash
+# perfil leve (recomendado para Nav2/MCP/testes)
+ros2 launch rover_bringup rover_mcp_sim.launch.py sim_lite:=true headless:=true
+ros2 launch rover_gazebo moon.launch.py sim_lite:=true
+
+# ajuste fino (vazio = vem do perfil)
+... sim_lite:=true camera_rate:=5
+... camera_width:=480 camera_height:=360 camera_rate:=15 camera_points:=true
+```
+
+## Como medir
+
+`gz stats` **não existe** no `gz_tools_vendor` do Jazzy (o binário está em
+`/opt/ros/jazzy/opt/gz_tools_vendor/bin/gz`, mas sem o subcomando `stats`).
+O RTF é medido pelo avanço do `/clock` contra o tempo de parede:
+
+```bash
+python3 tools/rtf_meter.py 20     # dentro do container
+```
+
+Sempre com a mesma carga: **sem LLM**, sem exploração, rover parado, depois
+de ~40 s de simulação estabilizada, janela de 20 s, simulação reiniciada do
+zero a cada medição.
+
+## Baseline
+
+| Verificação | Resultado |
+|---|---|
+| RTF | 0,09 com LLM (qwen2.5:7b na CPU); ~0,18 sem |
+| CPU | `gz sim` ≈ 300 %, `llama-server` ≈ 190 %, nós do Nav2 8–17 % cada |
+| Ociosidade | ~55 % da CPU ociosa → gargalo serial dentro do Gazebo |
+| Câmera de profundidade | 1,38 MB/msg; ~30 Hz em tempo simulado |
+| `/camera/points` | nuvem de pontos atravessando a bridge |
+| Memória | sem swap ativo — **RAM não é o problema** |
+
+## Bisect: renderização ou física?
+
+Teste deliberadamente exagerado: **só** `update_rate` da câmera 30 → 2.
+
+| Configuração | RTF |
+|---|---|
+| Original | 0,188 |
+| Câmera a 2 Hz | **0,630** |
+
+RTF ≥ 0,6 → o gargalo dominante é a **renderização da câmera RGBD**. A
+mudança foi revertida (diagnóstico, não solução).
+
+## Uma mudança por medição
+
+Cada linha reinicia a simulação do zero e acumula a mudança anterior.
+
+| # | Mudança | RTF | Ganho |
+|---|---|---|---|
+| M0 | nada (regressão do código novo com defaults) | 0,178 | — |
+| M1 | `/camera/points` fora da bridge; costmap local em `/scan` | 0,196 | +0,02 |
+| M2 | + resolução 720×480 → 320×240 | 0,213 | +0,02 |
+| M3 | + taxa 30 → 10 Hz (= `sim_lite:=true`) | **0,420** | **+0,21** |
+| M4 | + taxa 10 → 5 Hz | 0,507 | +0,09 |
+
+**Leitura:** o custo é **por quadro renderizado**, não por pixel. Cortar os
+pixels para um quarto quase não mudou nada; cortar a taxa mudou tudo. O que
+pesa é renderizar a cena (terreno lunar) a cada quadro, duas vezes (RGB +
+profundidade). Rendimento decrescente: 30 Hz → 0,21; 10 Hz → 0,42;
+5 Hz → 0,51; 2 Hz → 0,63.
+
+## O que o `sim_lite` muda
+
+| | Completo (default) | `sim_lite:=true` |
+|---|---|---|
+| Câmera RGBD | 720×480 @ 30 Hz | 320×240 @ 10 Hz |
+| `/camera/points` na bridge | sim | não |
+| Obstáculos do costmap local | `voxel_layer` ← `/camera/points` | `obstacle_layer` ← `/scan` |
+
+`/camera/points` **tinha um consumidor real**: o `voxel_layer` do
+`local_costmap` era a única fonte de obstáculos locais. Tirar a nuvem da
+bridge sem trocar a fonte deixaria o Nav2 cego. No perfil leve, o costmap
+local passa a usar o lidar (2D, ±1 rad à frente) via `ObstacleLayer`.
+
+Onde está:
+
+- `ros2/rover_description/robots/rover.urdf.xacro` — `xacro:arg` `camera_width`,
+  `camera_height`, `camera_rate` (defaults = perfil completo)
+- `ros2/rover_description/launch/robot_state_publisher.launch.py` e
+  `ros2/rover_gazebo/launch/include/spawn.launch.py` — repassam os args ao xacro
+- `ros2/rover_gazebo/launch/gazebo.launch.py` — `sim_lite` + ajuste fino, bridge
+  com/sem nuvem, `local_obstacle_source` para o Nav2
+- `ros2/rover_navigation/launch/bringup.launch.py` — `local_obstacle_source:=camera|scan`
+
+## Validação da localização (perfil leve)
+
+A câmera alimenta `rgbd_odometry` → `/odom_rgbd` → EKF (+ IMU) → `/odom`.
+Degradar a câmera não pode quebrar essa cadeia.
+
+| Checagem | `sim_lite` | Completo |
+|---|---|---|
+| `/odom_rgbd` publica | ✅ ~10 Hz sim, covariância baixa (VO não perdida) | ✅ |
+| EKF `/odom` | ✅ | ✅ |
+| TF `map→base_link` | ✅ sem `NaN`, sem quebra | ✅ |
+| `/map` (slam_toolbox) | ✅ | ✅ |
+| Goal `map (2,0; 0,5)` | ✅ `SUCCEEDED` | ✅ `SUCCEEDED` (94 s de parede) |
+| Pose final no `map` | (1,52; 0,42) — 0,48 m do alvo | (1,85; 0,62) — 0,19 m do alvo |
+| Divergência `/odom` × `map` ao fim | 0,40 m | 0,33 m |
+
+A deriva da odometria (corrigida depois pelo slam_toolbox) **já existia no
+perfil completo** — não é efeito do `sim_lite`. A pose final mais longe do
+alvo no perfil leve é uma rodada só de cada; precisa de repetições para
+separar de ruído.
+
+## Prioridade de CPU (`nice 12`)
+
+Todos os processos do container rodam em `nice 12`. A origem **não está no
+repositório**: é o **System76 Scheduler** (`com.system76.Scheduler.service`,
+Pop!_OS), que rebaixa `dockerd`/`containerd` como serviço de fundo, e o
+container herda. O systemd não define `Nice` para o Docker. Como é
+configuração local da máquina, não foi alterada. Entre processos do ROS o
+efeito é neutro; contra o desktop em `nice 0`, o Gazebo perde arbitragem.
+
+## Limitações e próximos passos
+
+- **A nuvem continua sendo gerada dentro do Gazebo.** O sensor é
+  `rgbd_camera`, que sempre produz `points`; tirar da bridge só elimina a
+  serialização. Não há opção no SDF do Harmonic para desligar essa saída.
+- **RTF ≥ 0,6 não foi atingido.** O próximo suspeito é o custo fixo: passo
+  de física (`moon.world` não tem bloco `<physics>`, usa 1 ms / 1000 Hz) e o
+  `gpu_lidar` a 10 Hz. Testar `max_step_size` 0,002 / 0,004 com checagens de
+  sanidade (rover não afunda, suspensão estável, teleop coerente).
+- Medições com uma rodada cada; o ruído observado entre reinícios foi ~±0,01.
+
+
+--------------------------------------------------------------------------------
+title: "Dev Container (VS Code)"
+url: https://blazemorales.github.io/rover_circ_ares/dev-container/index.md
+description: Como abrir o projeto no VS Code com Dev Containers: ROS 2 Jazzy, Gazebo e RViz2 sem instalar nada no host.
+--------------------------------------------------------------------------------
+
+{{< toc >}}
+
+Este guia destina-se a iniciantes que desejam configurar e executar o projeto **rover_circ_ares** rapidamente utilizando **VS Code Dev Containers**. 
+
+Com o Dev Container, você não precisa instalar manualmente o ROS 2, Gazebo, Python, C++ ou dependências no seu sistema operacional hospedeiro. Tudo roda de forma isolada e pronta para uso dentro de um container Docker pré-configurado.
+
+---
+
+## 📋 Pré-requisitos
+
+Antes de começar, certifique-se de ter os seguintes programas instalados no seu computador:
+0. **Linux**. A distribuição que a gente vai usar vai ser o Ubuntu 24.04 LTS. Então caso você não tenha, é necessario instalar o WSL no windowns.
+1. **Docker**:
+   - **Linux**: [Docker Engine](https://docs.docker.com/engine/install/)
+2. **Visual Studio Code (VS Code)**: [Baixar VS Code](https://code.visualstudio.com/)
+3. **Extensão Dev Containers no VS Code**:
+   - Abra o VS Code, vá na aba de extensões (`Ctrl+Shift+X` ou `Cmd+Shift+X`) e procure por **Dev Containers** (criada pela Microsoft). Clique em **Instalar**.
+
+---
+
+## 🚀 Como Inicializar o Ambiente (Passo a Passo)
+
+### 1. Permitir acesso à interface gráfica (Apenas no Linux)
+Se você estiver utilizando Linux no hospedeiro e quiser visualizar as simulações do Gazebo e o RViz2, execute o seguinte comando no terminal do seu computador antes de abrir o container:
+
+```bash
+xhost +local:root
+```
+
+### 2. Abrir o Projeto no VS Code
+Abra a pasta do repositório `rover_circ_ares` no VS Code:
+- Menu `Arquivo` > `Abrir Pasta...` > selecione a pasta `rover_circ_ares`.
+
+### 3. Reabrir no Container
+Ao abrir a pasta, o VS Code exibirá uma notificação no canto inferior direito perguntando se deseja **"Reopen in Container"** (Reabrir no Container).
+
+Caso a notificação não apareça:
+1. Pressione `Ctrl + Shift + P` (ou `Cmd + Shift + P` no Mac) para abrir a Paleta de Comandos.
+2. Digite e selecione: **`Dev Containers: Reopen in Container`**.
+
+### 4. Aguardar o Build Inicial
+Na primeira vez que você abrir o Dev Container:
+- O Docker baixará a imagem base do **ROS 2 Jazzy**.
+- O ambiente instalará os pacotes e dependências automaticamente (`rosdep install`).
+- O projeto será compilado automaticamente com o `colcon build`.
+
+> ⏳ **Nota:** A primeira compilação pode levar alguns minutos dependendo da sua conexão de internet e processador. Nas execuções seguintes, o carregamento será quase instantâneo.
+
+---
+
+## 🛠️ Como Usar e Testar o Projeto
+
+Quando o container carregar, abra o terminal integrado do VS Code (`Ctrl + '` ou menu `Terminal` > `Novo Terminal`).
+
+O terminal já estará dentro do container (`/workspaces/ros2_ws/src/rover_circ_ares`) e com as variáveis do ROS 2 devidamente configuradas.
+
+### Compilando o Código (Se você fizer alterações)
+Caso faça alterações no código C++ ou Python e precise recompilar:
+
+```bash
+cd /workspaces/ros2_ws
+colcon build
+source install/setup.bash
+```
+
+---
+
+### 🌌 Simulações no Gazebo
+
+Você pode iniciar as simulações do rover em diferentes cenários pré-configurados:
+
+#### 1. Simulação na Lua (Moon) - *Funcionando*
+```bash
+ros2 launch rover_gazebo moon.launch.py
+```
+
+#### 2. Simulação em Marte (Mars) e Floresta (Forest) - *Em Manutenção / Com Falha Atualmente*
+> ⚠️ **Aviso:** Os arquivos de launch `mars.launch.py` e `forest.launch.py` não estão funcionando no momento.
+
+---
+
+### 🕹️ Teleoperação (Controle por Teclado ou Joystick)
+
+O pacote de teleoperação é o **`rover_teleop`**.
+
+#### 1. Teleoperação por Teclado (Keyboard)
+Para controlar o robô usando o teclado (WASD / setas do teclado):
+```bash
+ros2 run rover_teleop teleop_keyboard_node
+```
+
+#### 2. Teleoperação por Joystick / Gamepad (PS3 / USB)
+Para controlar o robô com um joystick PS3 / controle USB:
+```bash
+ros2 launch rover_teleop joy_teleop.launch.py
+```
+
+---
+
+## ❓ Resolução de Problemas Comuns (Troubleshooting)
+
+### 1. Erro no RViz2 / Gazebo (`Authorization required, but no authorization protocol specified` ou `could not connect to display :0`)
+- **Causa:** O servidor X11 do seu Linux (computador hospedeiro) bloqueia por padrão que containers Docker exibam janelas gráficas sem autorização explícita.
+- **Solução Rápida:** No terminal da sua máquina **hospedeira** (no seu Linux, **fora** do container/VS Code), execute o comando:
+  ```bash
+  xhost +local:root
+  ```
+  *(Se preferir liberar para qualquer conexão local no seu usuário: `xhost +`)*
+
+- Em seguida, tente rodar o `rviz2` ou as simulações no terminal do container novamente. O RViz2 abrirá normalmente!
+
+### 2. Quero refazer o build do Container do zero
+- **Solução:** Pressione `Ctrl + Shift + P` e selecione **`Dev Containers: Rebuild Container`**.
+
+### 3. Conectando dispositivos USB (Motores LX-16A, LiDAR Hokuyo ou Joystick)
+- O container foi configurado com `--privileged`, o que significa que portas seriais e dispositivos conectados ao seu computador (como `/dev/ttyUSB0` ou `/dev/input/js0`) são mapeados automaticamente para dentro do container.
+
+---
+
+## 📂 Estrutura do Dev Container
+
+- `.devcontainer/Dockerfile`: Define a imagem base ROS 2 Jazzy e instala os utilitários de sistema e bibliotecas do Gazebo/RViz2.
+- `.devcontainer/devcontainer.json`: Configura a integração com o VS Code, mapeamento de pastas do workspace (`/workspaces/ros2_ws`), extensões automáticas de C++, Python e ROS, e permissões de rede/GUI.
+
+
+--------------------------------------------------------------------------------
+title: "Diário de Bordo — Rover Sim"
+url: https://blazemorales.github.io/rover_circ_ares/diario-de-bordo/index.md
+description: Log técnico do desenvolvimento da simulação do rover: decisões, bugs encontrados e correções.
+--------------------------------------------------------------------------------
+
+{{< toc >}}
+
+Log técnico incremental. Cada entrada documenta o estado do projeto num dado
+momento — o que foi decidido, o que quebrou e como foi corrigido. Ver também
+os [Comandos Essenciais](/comandos-essenciais-simulacao) para rodar o que
+está descrito aqui.
+
+## 2026-11-16 — Pendências em aberto
+
+Estado consolidado das pendências técnicas (antes no `to_continue.md`, que
+saiu da raiz do repositório na reorganização).
+
+**Navegação no terreno lunar:** melhorou de ~1/7 para 6/7 goals com o perfil
+`uneven_terrain` (detalhes em [Chat Web](/chat-web)). Próximo passo: detectar
+rampas íngremes de verdade com a câmera de profundidade (análise de
+inclinação), já que o lidar 2D não distingue chão de parede.
+
+**Chat web:** falta validar com Groq e Render reais. Já foi validado
+localmente com o Ollama.
+
+**Desempenho:** a meta de RTF ≥ 0,6 não foi atingida (0,42 com `sim_lite`).
+O custo restante é fixo: física com passo de 1 ms (o `moon.world` não tem
+bloco `<physics>`) e o gpu_lidar. A próxima ideia é testar `max_step_size`
+0,002/0,004 com checagens de sanidade.
+
+**Não bloqueantes:**
+- O footprint em `ros2/rover_navigation/params/costmaps.yaml` é um placeholder
+  de 0,6×0,6 m, não a medida real do chassi.
+- A rolling window do `global_costmap` tem 30×30 m. Se o explore parecer
+  "míope", aumente.
+- Avisos ocasionais de "Control loop missed its desired rate" e "Message
+  Filter dropping message" vêm de contenção de CPU. `headless:=true` e
+  `sim_lite:=true` ajudam.
+
+## 2026-11-11 — ROS-MCP e desempenho da simulação
+
+**ROS-MCP:** o rover passou a aceitar comandos em linguagem natural via Model
+Context Protocol. O LLM (qwen2.5:7b no Ollama) fala com um proxy restrito,
+`rover_mcp_safe`, que fala com o `rosbridge` dentro do container. O LLM só
+manda goals ao Nav2 e lê estado: `/cmd_vel` é bloqueado no proxy **e** no
+próprio rosbridge. Validação: o LLM leu a odometria corretamente e uma
+tentativa de publicar velocidade foi recusada; os goals mandados pelo LLM
+abortaram com o `explore_lite` ativo e o modelo relatou sucesso — pendente.
+Detalhes em [ROS-MCP](/ros-mcp).
+
+**Desempenho:** a simulação rodava a RTF ~0,18. Um bisect mostrou que o
+gargalo é a renderização da câmera RGBD, e que o custo é por quadro, não por
+pixel. Novo perfil `sim_lite:=true` (320×240 @ 10 Hz, sem nuvem de pontos,
+costmap local no lidar) leva o RTF a 0,42 sem quebrar a odometria visual.
+Detalhes em [Desempenho da Simulação](/desempenho-simulacao).
+
+## 2026-09-21 — Navegação autônoma (SLAM + exploração + Nav2): funcionando
+
+**Objetivo:** o rover simulado explora sozinho (frontier exploration) e
+navega com Nav2 evitando obstáculos, sem teleop e sem goals manuais.
+
+**Resultado:** confirmado funcionando de ponta a ponta (headless e com GUI).
+O rover se move sozinho via `explore_lite` + Nav2, o `/map` do
+`slam_toolbox` cresce continuamente, e não aparecem mais avisos de "Robot is
+out of bounds of the costmap".
+
+### Decisão de escopo
+
+O pacote `rover_nav2` mencionado em planos anteriores nunca chegou a existir
+de fato. O repo upstream já trazia `rover_navigation` (SmacHybrid/SmacLattice
++ RPP/TEB) funcionando. A lacuna real era SLAM + exploração autônoma, então
+foi criado um pacote novo, `rover_slam` (slam_toolbox + AMCL + explore_lite),
+sem tocar em `rover_motor_controller_cpp/serial.cpp` e `.hpp` (edições locais
+do usuário, propositalmente preservadas).
+
+### O que foi feito
+
+- Novo pacote `rover_slam/`:
+  - `config/slam_toolbox.yaml`, `config/amcl.yaml`, `config/explore_params.yaml`
+  - `launch/slam.launch.py` (slam_toolbox como lifecycle node, configure → activate)
+  - `launch/amcl.launch.py` (map_server + amcl + lifecycle_manager_localization)
+  - `launch/explore.launch.py` (explore_lite, do fork `robo-friends/m-explore-ros2`)
+- `rover_gazebo/launch/gazebo.launch.py`:
+  - argumentos novos: `slam` (default `True`), `explore` (default `True`), `map`,
+    `headless` (default `False` — roda `gz sim -s`, sem GUI, útil para
+    testes/CI sem gastar CPU em renderização)
+  - trocou o include único de `rover_localization/launch/localization.launch.py`
+    (que subia o `rtabmap` junto) por dois includes separados:
+    `rgbd_odometry.launch.py` + `ekf.launch.py` (só odometria, sem SLAM visual)
+  - inclui os launches do `rover_slam` condicionalmente
+- `rover_gazebo/launch/moon.launch.py`: agora repassa `headless`, `slam`,
+  `explore`, `launch_rviz` para `gazebo.launch.py` (antes ficavam presos aos
+  defaults, sem poder sobrescrever via `ros2 launch ... slam:=False` etc.)
+
+### Bugs encontrados e corrigidos
+
+1. **Conflito de dono do `/map`.** `rtabmap` (SLAM visual, dentro do
+   `localization.launch.py` original) competia com `slam_toolbox` pela
+   transform `map → odom`. Corrigido subindo só `rgbd_odometry` + `ekf`
+   (odometria), sem o `rtabmap` completo.
+2. **`slam_toolbox` nunca ativava.** É um lifecycle node; o launch inicial
+   usava um `Node` simples. Corrigido com `LifecycleNode` +
+   `EmitEvent`/`RegisterEventHandler` (configure → activate), copiando o
+   padrão do `online_async_launch.py` oficial do `slam_toolbox`.
+3. **Processos zumbis entre testes.** `pkill -f` não matava tudo de forma
+   confiável; sobravam `robot_state_publisher`/`joint_state_publisher`/bridges
+   de execuções anteriores rodando junto com a atual, brigando pela tf.
+   Forma segura de limpar, dentro do container:
+   ```shell
+   ps -eo pid=,comm= | awk '$1 != 1 {print $1}' | xargs -r kill
+   ```
+   **Nunca** usar `pkill -f` com padrões genéricos como `ros2`: casa com a
+   própria linha de comando do `docker exec bash -c "..."` (que contém
+   `/ros2_ws/`) e mata o processo errado — já aconteceu de derrubar o PID 1
+   do container e precisar `docker start <container>` de novo.
+4. **`/scan` com `frame_id` errado**, causa raiz do `slam_toolbox` descartar
+   todo scan (mensagens "Message Filter dropping message... frame does not
+   exist" / "timestamp earlier than transform cache"). O sensor lidar
+   (`rover_description/urdf/sensors/hokuyo.urdf.xacro`) não tinha a tag
+   `<gz_frame_id>`, então o Gazebo publicava `/scan` com
+   `frame_id: rover/base_link/lidar` — uma frame que não existe na árvore de
+   tf (o link real se chama `laser_link`). Corrigido adicionando
+   `<gz_frame_id>${prefix}_link</gz_frame_id>` dentro do `<sensor>` do lidar,
+   igual já era feito para o RGBD (`<optical_frame_id>camera_frame</optical_frame_id>`
+   em `asus_xtion.urdf.xacro`).
+5. **"Robot is out of bounds of the costmap" / "Robot out of costmap
+   bounds"** no `explore_lite`. O `global_costmap` (em
+   `rover_navigation/params/costmaps.yaml`) não tinha `rolling_window`,
+   então seus limites vinham direto do `/map` do `slam_toolbox`. No início
+   da exploração, a área embaixo/atrás do robô ainda não tinha sido varrida
+   pelo lidar (ponto cego atrás do sensor), então o `/map` nascia sem cobrir
+   a pose do robô — e como o `explore_lite` também lê
+   `/global_costmap/costmap`, isso travava os dois num deadlock: sem costmap
+   válido não navega, sem navegar o mapa não cresce. Corrigido adicionando
+   `rolling_window: true`, `width: 30`, `height: 30` ao `global_costmap` —
+   ele passa a ficar sempre centrado no robô, independente de onde o `/map`
+   do SLAM já cresceu.
+6. **Gazebo GUI travava** com "Authorization required, but no authorization
+   protocol specified" / "could not connect to display :0", e o launch
+   matava o `gz sim server` inteiro junto com a GUI. Faltava autorização X11
+   do host para o container. Corrigido no host com `xhost +local:docker`
+   (não persiste entre reboots — repetir se voltar a acontecer). Para testes
+   automatizados/CI, usar `headless:=True` em vez de depender de X11.
+7. **Robô nunca se movia fisicamente**, mesmo publicando `/cmd_vel`
+   manualmente e mesmo com Nav2 enviando goals — causa raiz de tudo "falhar
+   em progredir" e do `explore_lite` esgotar frontiers rapidamente sem o
+   robô sair do lugar. O pacote `ros2controlcli` (fornece o verbo
+   `ros2 control`, usado por `rover_gazebo/launch/include/spawn.launch.py`
+   para ativar `joint_state_broadcaster`/`position_controller`/
+   `velocity_controller` via `ros2 control load_controller --set-state
+   active ...`) não estava instalado na imagem/container. Os processos de
+   spawn morriam na hora com `invalid choice: 'control'` (exit code 2), e
+   `ros2 service call /controller_manager/list_controllers ...` confirmava
+   zero controllers ativos. Corrigido:
+   - instalado `ros-jazzy-ros2controlcli` no container (não persiste se a
+     imagem for reconstruída do zero)
+   - adicionado `<depend>ros2controlcli</depend>` em
+     `rover_gazebo/package.xml`, para que `rosdep install --from-paths src
+     --ignore-src -r -y` (chamado no `Dockerfile` da raiz do repo) instale
+     isso automaticamente em builds futuros da imagem.
+
+### Status confirmado
+
+Testado tanto com `headless:=True` quanto com a GUI normal do Gazebo (depois
+do `xhost +local:docker`):
+
+- `/scan` publica de verdade, com `frame_id: laser_link` correto.
+- `map → base_link` resolve e atualiza continuamente.
+- `/map` cresce sem parar enquanto o robô explora (visto crescendo de 90x62
+  para 173x193+ células em ~1 min de exploração).
+- Zero ocorrências de "Robot is out of bounds of the costmap" ou
+  "[FrontierSearch] Robot out of costmap bounds".
+- `explore_lite` conecta no Nav2, manda goals sozinho, e não para cedo com
+  "All frontiers traversed/tried out" (isso só acontecia antes porque o robô
+  ficava fisicamente parado — bug #7).
+- Robô se desloca de verdade (odom saindo de `(0,0)` e progredindo, ex.:
+  `(0.33, 2.10) → (1.72, 3.33)` em ~1 min), sem teleop nem goal manual.
+- `ros2 service call /controller_manager/list_controllers ...` mostra os 3
+  controllers (`joint_state_broadcaster`, `position_controller`,
+  `velocity_controller`) com `state='active'`.
+
+### Pendências conhecidas (não bloqueantes)
+
+- Footprint em `rover_navigation/params/costmaps.yaml` é placeholder
+  0.6x0.6m, não é a medida real do chassi Sawppy — ajustar só se o
+  comportamento de desvio de obstáculo parecer errado na prática.
+- `width`/`height: 30` (metros) do `global_costmap` rolling window é um
+  chute razoável para o tamanho do `moon.world` (~100x100m de terreno) — se
+  o `explore_lite` parecer "míope" (só olhando frontiers muito perto),
+  considerar aumentar.
+- Ainda aparecem alguns "Message Filter dropping message... timestamp
+  earlier than transform cache" ocasionais e "Control loop missed its
+  desired rate" no `controller_server` — sintoma de contenção de CPU
+  (Gazebo + Nav2 + SLAM juntos). Não impede o progresso, mas
+  `headless:=True` ajuda bastante.
+- Se a imagem Docker for reconstruída do zero, o `ros2controlcli` já vem
+  incluído via `rosdep install` (fix do bug #7 no `package.xml`) — não
+  precisa mais instalar manualmente.
+
+### Como retomar
+
+Repositório montado dentro do container em `/workspaces/ros2_ws` (mesmo
+diretório do host). Não instalar ROS 2/colcon no host — tudo roda dentro do
+container, de propósito. Comandos completos em
+[Comandos Essenciais](/comandos-essenciais-simulacao).
+
+Para GUI: `xhost +local:docker` no host antes de abrir o container (não
+persiste entre reboots). Para rodar sem GUI (CI/testes rápidos):
+`headless:=True`.
+
+```shell
+ros2 launch rover_gazebo moon.launch.py slam:=True explore:=True headless:=True
+```
+
+## 2026-09-22 — `explore_lite` nunca estava de fato no workspace: achado e corrigido
+
+**Objetivo:** validar ao vivo, rodando de verdade dentro do `rover_dev`, que
+o `slam:=True explore:=True` da entrada anterior funciona ponta a ponta.
+
+**Resultado:** não funcionava.
+`ros2 launch rover_gazebo moon.launch.py slam:=True explore:=True headless:=True`
+morria logo no início com `package 'explore_lite' not found`, derrubando
+(cascade shutdown) tudo que já tinha subido.
+
+### Causa raiz
+
+`rover_slam/package.xml` declara `<depend>explore_lite</depend>`, mas
+`explore_lite` é um fork (`robo-friends/m-explore-ros2`, pacote na subpasta
+`explore/`, mais uma dependência dele, `explore_lite_msgs`) que não é uma
+chave resolvível pelo `rosdep`. O `Dockerfile` roda
+`rosdep install --from-paths src --ignore-src -r -y` — a flag `-r` faz o
+`rosdep` **pular em silêncio** dependências que falham em resolver, então o
+pacote nunca chegou a existir de fato no workspace, apesar do `package.xml`
+parecer completo e do build do Docker terminar sem erro visível.
+
+**Correção:** vendorizados `explore_lite/` e `explore_lite_msgs/` (do fork
+acima; `map_merge/`, que não é usado aqui, ficou de fora) como pastas de
+pacote no nível raiz do repo, no mesmo padrão flat de `rover_slam`/
+`rover_navigation`. Assim o `colcon build` resolve por nome de pacote
+dentro do próprio workspace, sem depender do `rosdep` pra isso.
+
+### Bug batido no caminho: processos `gz sim` órfãos
+
+Durante os testes, ficou mais de uma instância de `gz sim` rodando ao mesmo
+tempo — o wrapper do `ros2 launch` morre no shutdown (ou quando a sessão do
+`docker exec` que o iniciou fecha), mas o processo `gz sim` de baixo escapa
+e fica órfão, reparented pro PID 1, continuando a rodar. Sintoma:
+`slam_toolbox` soltando "Message Filter dropping message... timestamp
+earlier than transform cache" sem parar, com o `/clock` pulando pra frente
+e pra trás — duas simulações concorrentes disputando o tempo. Resolvido
+listando `ps -ef | grep "gz sim"` e matando por PID exato (repetindo o
+aviso já dado acima sobre `pkill -f`: `pkill -f "gz sim"`/`pkill -f "ros2"`
+também casa com a própria linha de comando do `docker exec`/`pgrep` usada
+pra limpar, e pode matar o processo errado).
+
+### Confirmado funcionando (depois da correção)
+
+- `map` resolve e `map` → `base_link` progride sozinho.
+- Os 3 controllers (`joint_state_broadcaster`, `position_controller`,
+  `velocity_controller`) ficam `active`.
+- `/map` cresceu de 96x80 para 106x83 células em ~40s de exploração.
+- Robô andou sozinho de `(0.68, 0.51)` para `(0.79, 1.03)` (tempo de sim
+  4.5s → 9.9s), sem teleop nem goal manual.
+- Zero ocorrência de "Robot is out bounds costmap" ou crash.
+
+
+--------------------------------------------------------------------------------
+title: "Requisitos do CIRC — Checklist"
+url: https://blazemorales.github.io/rover_circ_ares/requisitos-circ/index.md
+description: Requisitos do regulamento e das provas do CIRC 2027 e o que falta no projeto, em forma de checklist.
+--------------------------------------------------------------------------------
+
+{{< toc >}}
+
+
+Base: regulamento e provas do CIRC 2027 ([R3] regras, [R4] provas, [R5] segurança), usados como
+especificação para competir em 2028. Fonte: *Levantamento Inicial CIRC v2 (05/11/2026)*.
+
+Os números `#` são as issues do repositório `Blazemorales/rover_circ_ares`. A [#26](https://github.com/Blazemorales/rover_circ_ares/issues/26) acompanha todas.
+
+## 1. Requisitos gerais do rover [R3]
+
+| Requisito | Valor |
+|---|---|
+| Massa | Abaixo de 50 kg (±1% de pontos por kg). Acima de 70 kg o rover não opera. |
+| Energia | Pelo menos 1 h só com bateria de bordo. Cabo de alimentação é proibido. |
+| Montagem | 15 min para montar e 10 min para desmontar. |
+| Ambiente | Chuva, lama, vento, escuridão e 40 °C do lado de fora. |
+| Manipulação | Objetos de até 5 kg e 90 mm de largura (garra abrindo até 100 mm). |
+| Tamanho | Passar por uma porta de 0,8 m. |
+| Autoria | Projeto da equipe. Pode usar bibliotecas abertas e controladores de motor comprados. |
+
+- [ ] Fechar o orçamento de massa e de energia do computador de bordo e dos sensores, junto com Elétrica e Estruturas ([#25](https://github.com/Blazemorales/rover_circ_ares/issues/25))
+- [ ] Self-check automático na inicialização para caber nos 15 min ([#18](https://github.com/Blazemorales/rover_circ_ares/issues/18))
+- [ ] Monitorar temperatura e cortar acima do limite ([#18](https://github.com/Blazemorales/rover_circ_ares/issues/18))
+
+## 2. Segurança [R5]
+
+**Fora do software (obrigatório):**
+
+- [ ] Kill switch físico, vermelho, iluminado e no topo, que corte toda a energia sem depender de computador
+- [ ] Nenhum outro botão vermelho no rover
+- [ ] Fusíveis ou disjuntores. Proteção só por software não vale.
+- [ ] Limites mecânicos nas juntas do braço. Limite por software não é mais aceito.
+- [ ] Bateria comercial com BMS comercial. LiFePO4 tem desconto de 40% no peso. Menos de 1000 Wh, fácil de remover.
+- [ ] Recomendado: parada remota por um rádio independente do link principal
+
+**Software ([#18](https://github.com/Blazemorales/rover_circ_ares/issues/18)):**
+
+- [ ] Gerente de modos (desarmado, manual, autônomo)
+- [ ] Watchdog no `/cmd_vel` e heartbeat da estação, com parada se o link cair
+- [ ] Telemetria de bateria, corrente e temperatura
+- [ ] Limites de velocidade por modo
+
+## 3. Comunicação [R3]
+
+| Requisito | Valor |
+|---|---|
+| Link | Sempre sem fio, sem celular nem satélite, dentro das regras da ISED |
+| Canais proibidos | 5 GHz: 140, 144, 149, 153, 157, 161 e 165 |
+| Antena | Mastro de até 4 m. Se for orientável, gira só por motor ou controle remoto. |
+| Backhaul | Ethernet 100BASE-TX, MTU 1500, sem DHCP, 50–100 Mbit/s |
+| Capacidade mínima | Dirigir, manipular e receber telemetria, mesmo sem vídeo |
+
+- [ ] Escolher o rádio e os canais junto com Telecom ([#25](https://github.com/Blazemorales/rover_circ_ares/issues/25))
+- [ ] IPs fixos, sem DHCP ([#19](https://github.com/Blazemorales/rover_circ_ares/issues/19))
+- [ ] Comando e telemetria com prioridade sobre o vídeo ([#19](https://github.com/Blazemorales/rover_circ_ares/issues/19))
+- [ ] Vídeo adaptativo com GStreamer em H.265 e troca de câmera ([#19](https://github.com/Blazemorales/rover_circ_ares/issues/19))
+- [ ] Monitor de link e testes com perda e atraso simulados por `tc netem` ([#19](https://github.com/Blazemorales/rover_circ_ares/issues/19))
+- [ ] Avaliar Zenoh contra DDS ([#19](https://github.com/Blazemorales/rover_circ_ares/issues/19))
+
+## 4. Autonomia [R3][R4]
+
+| Requisito | Valor |
+|---|---|
+| Definição | Nenhuma entrada do operador. Qualquer toque nos controles anula a autonomia. |
+| Waypoints | GNSS, WGS 84, graus decimais |
+| Rumo | Norte geográfico = 0°, com a declinação de Drumheller |
+| Distâncias | Medidas pelo odômetro sobre o terreno |
+| ArUco | Dicionário 4x4_100, leitura mostrada automaticamente ao juiz |
+
+- [ ] GNSS na simulação, `navsat_transform` e EKF fundindo GNSS, IMU e odometria de rodas ([#11](https://github.com/Blazemorales/rover_circ_ares/issues/11))
+- [ ] Rumo absoluto com correção de declinação ([#12](https://github.com/Blazemorales/rover_circ_ares/issues/12))
+- [ ] Indicador de entrada e saída do modo autônomo ([#15](https://github.com/Blazemorales/rover_circ_ares/issues/15))
+- [ ] Detecção ArUco com tela para o juiz ([#16](https://github.com/Blazemorales/rover_circ_ares/issues/16))
+
+## 5. Provas de 2027 [R4]
+
+### Automated Demolition and Clearing (inteiramente autônoma)
+
+- [ ] Actions de movimento: `Drive Forward` e `Drive Backwards` (1/3/5 m), `Rotate`, `Rotate and Drive` ([#14](https://github.com/Blazemorales/rover_circ_ares/issues/14))
+- [ ] `Face Bearing`, `Report Bearing`, `Report GNSS`, `Drive to Waypoint` (até 3 m), `Drive to Marked Waypoint` (até 1 m) ([#14](https://github.com/Blazemorales/rover_circ_ares/issues/14))
+- [ ] `Read and Store Markers` e `Retrieve Markers` ([#16](https://github.com/Blazemorales/rover_circ_ares/issues/16))
+- [ ] Comandos EFF do braço ([#23](https://github.com/Blazemorales/rover_circ_ares/issues/23))
+- [ ] UI do juiz com botões `[short] long name`, campos com unidade e disparo com um clique ([#15](https://github.com/Blazemorales/rover_circ_ares/issues/15))
+
+### Meteorite Search (sem GPS)
+
+- [ ] Navegação por odometria de rodas e IMU, relativa a marcos ([#13](https://github.com/Blazemorales/rover_circ_ares/issues/13))
+- [ ] Fotos de dois ângulos (≥ 90° entre elas) e panorama de 180°/360° ([#17](https://github.com/Blazemorales/rover_circ_ares/issues/17))
+- [ ] Leitura do contador Geiger por TRS ([#22](https://github.com/Blazemorales/rover_circ_ares/issues/22))
+- [ ] Relatório entregue até 2 h depois da prova ([#20](https://github.com/Blazemorales/rover_circ_ares/issues/20))
+
+### Reactor Recovery
+
+- [ ] Setores com tempestade em horário marcado, via keepout do Nav2 variando no tempo ([#21](https://github.com/Blazemorales/rover_circ_ares/issues/21))
+- [ ] Receptor de beacon por UART/TRS ([#22](https://github.com/Blazemorales/rover_circ_ares/issues/22))
+- [ ] Pegar objetos de até 5 kg com ponto de pega de até 80 mm ([#23](https://github.com/Blazemorales/rover_circ_ares/issues/23))
+
+### Prison Break (à noite)
+
+- [ ] Terminal serial do console de segurança por TRS ([#22](https://github.com/Blazemorales/rover_circ_ares/issues/22))
+- [ ] Câmeras para pouca luz, sem iluminar o chão, nem com infravermelho (hardware e [#24](https://github.com/Blazemorales/rover_circ_ares/issues/24))
+
+### Mining Site Remote Operations
+
+- [ ] Operação inteira pelo backhaul, dentro do limite de banda ([#19](https://github.com/Blazemorales/rover_circ_ares/issues/19))
+- [ ] Opcional: usar a nuvem de pontos LIDAR de 2018 no planejamento ([#24](https://github.com/Blazemorales/rover_circ_ares/issues/24))
+
+## 6. Braço [R3][R4] ([#23](https://github.com/Blazemorales/rover_circ_ares/issues/23))
+
+- [ ] Braço e garra no URDF, com ros2_control
+- [ ] MoveIt 2 e MoveIt Servo
+- [ ] Câmera na garra para aproximação guiada por ArUco
+- [ ] Marca de referência na ponta e relatório de x/y/z relativo ao pacote indicador
+
+## 7. Infraestrutura e testes
+
+- [ ] Mundo de simulação com ArUco, torres, objetos e cenário noturno ([#24](https://github.com/Blazemorales/rover_circ_ares/issues/24))
+- [ ] Gravação com `ros2 bag` e log de missão ([#20](https://github.com/Blazemorales/rover_circ_ares/issues/20))
+- [ ] Documento de interfaces com Embarcados, Elétrica, Telecom e Estruturas ([#25](https://github.com/Blazemorales/rover_circ_ares/issues/25))
+
+## Já atendido
+
+- [x] ROS 2 Jazzy com Nav2, rtabmap e slam_toolbox
+- [x] Simulação em Gazebo com ros2_control
+- [x] Teleoperação por joystick e teclado
+- [x] CI e imagem Docker (o workspace compila de uma máquina limpa)
+- [x] Navegação em terreno irregular e missões em sequência (`run_mission`)
+
+## Parcialmente atendido
+
+- [ ] Implantação via systemd: o serviço existe, mas o boot ainda não é reproduzível (ver [auditoria de prontidão](/auditoria-prontidao), item L10, e [#32](https://github.com/Blazemorales/rover_circ_ares/issues/32))
+
+## Ordem sugerida
+
+A segurança vem primeiro: sem ela não dá para ligar o rover real nem fazer bancada. Detalhes na [auditoria de prontidão](/auditoria-prontidao).
+
+1. [#32](https://github.com/Blazemorales/rover_circ_ares/issues/32) e [#18](https://github.com/Blazemorales/rover_circ_ares/issues/18): respostas da equipe sobre o hardware e segurança dos motores (watchdog, parada ao encerrar, limites), antes de qualquer teste em hardware real
+2. [#19](https://github.com/Blazemorales/rover_circ_ares/issues/19): rede entre estação e rover, com teste de queda de link
+3. [#11](https://github.com/Blazemorales/rover_circ_ares/issues/11), [#12](https://github.com/Blazemorales/rover_circ_ares/issues/12) e [#14](https://github.com/Blazemorales/rover_circ_ares/issues/14): GNSS, rumo e actions de movimento
+4. [#16](https://github.com/Blazemorales/rover_circ_ares/issues/16) e [#15](https://github.com/Blazemorales/rover_circ_ares/issues/15): ArUco e UI do juiz. Com isso a prova de demolição já pode ser treinada inteira na simulação.
+5. [#13](https://github.com/Blazemorales/rover_circ_ares/issues/13), [#17](https://github.com/Blazemorales/rover_circ_ares/issues/17), [#20](https://github.com/Blazemorales/rover_circ_ares/issues/20) a [#22](https://github.com/Blazemorales/rover_circ_ares/issues/22) e [#24](https://github.com/Blazemorales/rover_circ_ares/issues/24): as outras provas
+6. [#23](https://github.com/Blazemorales/rover_circ_ares/issues/23): braço, no 1º semestre de 2028
+
+
+--------------------------------------------------------------------------------
+title: "ROS-MCP — Comandar o Rover em Linguagem Natural"
+url: https://blazemorales.github.io/rover_circ_ares/ros-mcp/index.md
+description: Arquitetura, camada de segurança e validação da integração do rover com LLMs via Model Context Protocol (ros-mcp + rosbridge).
+--------------------------------------------------------------------------------
+
+{{< toc >}}
+
+```
+LLM local (Ollama, qwen2.5:7b, no PC)
+   ↓ MCP (stdio)                      ollmcp  (cliente MCP p/ Ollama)
+rover_mcp_safe                        ← proxy restrito, roda no PC (fora do container)
+   └─ ros-mcp 3.1.2 (in-process)
+   ↓ WebSocket :9090
+rosbridge_server + rosapi             ← dentro do container (PC na simulação, Pi no robô)
+   ↓ ROS 2 Jazzy
+Nav2 + slam_toolbox/AMCL + explore_lite
+```
+
+**Princípio:** o LLM envia *goals* e lê *estado*. Ele nunca publica em
+`/cmd_vel`. Exploração autônoma é do `explore_lite`; o LLM só liga/desliga.
+
+## Peças
+
+| Arquivo | Papel |
+|---|---|
+| `Dockerfile`, `.devcontainer/Dockerfile` | instalam `ros-jazzy-rosbridge-server` |
+| `.devcontainer/devcontainer.json` | `forwardPorts: [9090]` (com `--net=host` a porta já é do host) |
+| `ros2/rover_bringup/launch/rosbridge.launch.py` | rosbridge + rosapi; serve também na Pi |
+| `ros2/rover_bringup/launch/rover_mcp_sim.launch.py` | entry point único da simulação |
+| `tools/rover_mcp_safe/rover_mcp_safe.py` | servidor MCP restrito (o que o LLM enxerga) |
+| `tools/rover_mcp_safe/test_policy.py` | teste offline da política (sem ROS) |
+| `tools/rover_mcp_safe/smoke_test.py` | teste MCP ponta a ponta contra a simulação |
+| `tools/rover_mcp_safe/llm_test.py` | prompts em linguagem natural via Ollama, não interativo |
+| `tools/rover_mcp_safe/setup_ollmcp.sh` | configura o `ollmcp` (temp 0.1, prompt, HIL) |
+
+`tools/rover_mcp_safe/` tem `COLCON_IGNORE`: não é pacote ROS e roda no host.
+
+## Uso
+
+Dentro do container:
+
+```bash
+ros2 launch rover_bringup rover_mcp_sim.launch.py slam:=true explore:=false
+# argumentos: slam, explore (default false), rosbridge (default true),
+# use_sim_time, world, initial_pose_z, headless, launch_rviz, map,
+# nav2_planner, nav2_controller, rosbridge_port
+```
+
+`rover_mcp_sim.launch.py` reaproveita `ros2/rover_gazebo/launch/gazebo.launch.py`
+inteiro (Gazebo → EKF → slam_toolbox/AMCL → Nav2 → explore_lite) via
+`IncludeLaunchDescription` e só acrescenta o rosbridge, 5 s depois. Nenhuma
+configuração de Nav2 foi duplicada. O mundo padrão é `moon.world`
+(`initial_pose_z:=2.11`).
+
+No robô real (Pi), só o rosbridge:
+
+```bash
+ros2 launch rover_bringup rosbridge.launch.py
+```
+
+No host (sem ROS instalado):
+
+```bash
+pipx install ros-mcp ollmcp
+ollama pull qwen2.5:7b
+tools/rover_mcp_safe/setup_ollmcp.sh            # robô real: setup_ollmcp.sh <IP da Pi>
+ollmcp -j ~/.config/ollmcp/rover-servers.json
+```
+
+## Camada de segurança (Fase 4): escolha (b), proxy FastMCP
+
+Opções avaliadas, na ordem do plano:
+
+- **(a) allowlist no cliente:** o `ollmcp` permite desligar tools na
+  interface, mas isso fica salvo só no config local do usuário e qualquer
+  outro cliente veria as 31 tools. Não serve como garantia.
+- **(b) proxy:** escolhida. `rover_mcp_safe.py` registra as tools do ros-mcp no
+  mesmo processo e aplica a política em duas camadas:
+  1. remove do servidor toda tool fora da allowlist (o LLM nem a vê);
+  2. um middleware valida os argumentos das tools de escrita que sobraram.
+- **(c) modo readonly por env:** **não existe** no ros-mcp 3.1.2. As únicas
+  variáveis lidas são `ROSBRIDGE_IP`, `ROSBRIDGE_PORT` e `ROS_DEFAULT_TIMEOUT`.
+
+| Tool | Política |
+|---|---|
+| `publish_for_durations`, `set_parameter`, `delete_parameter`, `connect_to_robot`, `view_saved_image`, `get_verified_robot*` | removidas |
+| `publish_once` | só tópicos em `ROVER_MCP_PUBLISH_TOPICS` (default `/explore/resume`); recusa sempre `*cmd_vel*`, controllers e tipos Twist/TwistStamped/Ackermann/JointTrajectory/Float64MultiArray |
+| `send_action_goal` | só `ROVER_MCP_ACTIONS` (default `/navigate_to_pose`, `/navigate_through_poses`); `/spin`, `/backup`, `/drive_on_heading`, `/follow_path` recusadas |
+| `call_service` | bloqueia `/_action/*` (contornaria a allowlist de actions), `set_parameters*`, `load_parameter_file`, `change_state`, `manage_nodes`, `/controller_manager/*` |
+| `subscribe_once` / `subscribe_for_duration` | recusa PointCloud2, Image, CompressedImage, OccupancyGrid; duração ≤ 5 s, ≤ 20 mensagens |
+| demais (leitura) | liberadas |
+
+24 das 31 tools ficam expostas. O `ollmcp` também está com
+*human-in-the-loop* ligado: cada tool call pede confirmação.
+
+### Segunda camada: o próprio rosbridge
+
+O rosbridge 2.7 do Jazzy aceita globs de permissão.
+`ros2/rover_bringup/launch/rosbridge.launch.py` sobe o `rosbridge_websocket` como
+`Node` (e não pelo XML oficial, que não repassa `actions_glob`) com:
+
+| Parâmetro | Default | Efeito |
+|---|---|---|
+| `topics_pub_glob` | `['/explore/resume']` | nenhum cliente WebSocket publica em `/cmd_vel`, mesmo sem o proxy |
+| `actions_glob` | `['/navigate_to_pose', '/navigate_through_poses']` | só goals de navegação Nav2 |
+
+Para liberar (ex.: depuração com outra ferramenta), use
+`topics_pub_glob:='' actions_glob:=''`. Os globs não são passados ao `rosapi`,
+porque lá eles filtrariam a listagem de tópicos, e não as permissões.
+`services_glob` fica livre: o bloqueio de serviços perigosos é feito no proxy.
+
+## Armadilhas
+
+- **rosbridge serializa tudo em JSON.** Nada de assinatura contínua em `/scan`,
+  câmera RGBD ou nuvem de pontos: na Pi 3 isso derruba o Nav2. O proxy recusa
+  os tipos pesados e limita `subscribe_for_duration`.
+- **Temperatura ≤ 0.1.** Acima disso o modelo local inventa nome de tool e gera
+  JSON quebrado. O `setup_ollmcp.sh` já grava 0.1.
+- **Modelos < 7B** não fazem tool calling confiável. Na Pi não roda LLM.
+- **Sem GPU** (caso deste PC) o qwen2.5:7b roda na CPU: algumas a dezenas de
+  segundos por resposta, e disputa RAM com Gazebo + Nav2. Use `headless:=true`
+  e `launch_rviz:=false` se faltar memória.
+- Os exemplos do tugbot no ros-mcp-server são Humble/Gazebo Classic; aqui é
+  Jazzy + Gazebo Harmonic (`ros_gz_sim`/`ros_gz_bridge`).
+
+## Validação (Fase 5)
+
+Executada em 2026-11-11 no PC (12 núcleos, 16 GB, sem GPU), container
+`rover:latest`, `rover_mcp_sim.launch.py slam:=true headless:=true launch_rviz:=false`.
+
+| # | Passo | Resultado |
+|---|---|---|
+| 0 | Infra | ✅ handshake WebSocket `101` em `localhost:9090`; `/cmd_vel`, `/odom`, `/scan`, `/map`, `/navigate_to_pose` presentes; 3 controllers `active` |
+| 1 | Teleop manual (`/cmd_vel` dentro do container) | ✅ rover andou 0,28 m (ver RTF abaixo) |
+| 2 | Goal manual (`ros2 action send_goal /navigate_to_pose`, x=2, y=0,5) | ✅ `SUCCEEDED`, chegou em (1,99; 0,52) |
+| 3 | Exploração sem LLM (`explore:=true`) | ⚠️ parcial: `/map` cresceu de 99×81 → 168×130 células em 4 min, rover se moveu sozinho, zero "out of bounds". Não rodou até o mapa fechar (`moon.world` ≈ 100×100 m) |
+| 4 | Leitura via MCP | ✅ sem LLM: `smoke_test.py` (topics, actions, `/odom`). Com LLM (qwen2.5:7b, temp 0.1): chamou `subscribe_once('/odom')` e respondeu a posição correta — **14,6 min** para 2 rodadas |
+| 5 | Goal via MCP | ✅ sem LLM: `send_action_goal('/navigate_to_pose')` → `success`, rover andou 1,94 m. Com LLM: ✅ "publique Twist em /cmd_vel" → `publish_once` **recusado** pelo proxy e o modelo recorreu sozinho a um goal Nav2. ❌ os goals do LLM (x=1 e x=3,y=3) terminaram em **status 6 (ABORTED)** e o modelo relatou sucesso — ver abaixo |
+| 6 | Explore comandado via MCP | ✅ sem LLM: `publish_once('/explore/resume', false→true)` aceito. ❌ com LLM: "pause a exploração" → tentou `/explore/resume` como **action** (recusado 2×) e depois mandou goal para (0,0); explore **não** pausou |
+
+Bloqueio no próprio rosbridge (sem o proxy): 4 s publicando 0,5 m/s em
+`/cmd_vel` por WebSocket cru → rover deslocou 0,001 m. ✅
+
+Scripts: `test_policy.py` (offline), `smoke_test.py` (MCP sem LLM),
+`llm_test.py` (LLM via Ollama, não interativo).
+
+### Falhas do teste com LLM (qwen2.5:7b)
+
+> **Resolvidas em 2026-11-12** pelas tools dedicadas `navigate_to`,
+> `stop_navigation`, `set_exploration` e `get_robot_pose` (ver [Chat Web](/chat-web)).
+> O perfil padrão do proxy (`nav`) não expõe mais `publish_once` /
+> `send_action_goal`; o comportamento antigo segue em `--profile full`.
+
+1. **Goals abortados com `explore_lite` ativo.** Os goals do LLM terminaram em
+   status 6 (ABORTED). Causa provável: o `explore_lite` seguia mandando os
+   próprios goals ao Nav2 e preemptava os do LLM. Mitigação: pausar o explore
+   antes de um goal manual (e o proxy pode fazer isso automaticamente).
+2. **`send_action_goal` responde `"success": true` mesmo com goal abortado.**
+   O ros-mcp só reporta que a chamada completou; o estado real está em
+   `status`. O modelo leu `success` e afirmou que chegou. Mitigação: o proxy
+   reescrever o resultado com o texto do status (`SUCCEEDED`/`ABORTED`/...).
+3. **Tópico confundido com action.** Mesmo com o prompt de sistema citando
+   `publish_once('/explore/resume', ...)`, o modelo chamou
+   `send_action_goal('/explore/resume', 'std_msgs/msg/Bool')`. Mitigação: a
+   mensagem de recusa do proxy indicar a tool correta, ou expor uma tool
+   dedicada `set_exploration(enabled: bool)`.
+
+Nenhuma dessas falhas furou a camada de segurança: tudo que foi recusado
+continuou recusado, e o rover nunca recebeu `/cmd_vel` do LLM.
+
+### Desempenho medido
+
+- **RTF da simulação: 0,09** (medido pelo `/clock`; `gz stats` não existe no
+  `gz_tools_vendor` do Jazzy). Mesmo sem LLM o RTF ficou em ~0,16.
+- `gz sim` ≈ 300 % CPU; `llama-server` ≈ 190 %. Sem pressão de RAM (sem swap ativo).
+- Câmera RGBD: `/camera/depth/image_raw` 1,38 MB/msg a ~30 Hz em tempo
+  simulado, mais `/camera/points`. Principal suspeita do RTF baixo, mas
+  alimenta o `rgbd_odometry` → EKF, então não dá para só desligar.
+- **Contexto do Ollama:** as 24 tools somam ~2,7 k tokens; o padrão de
+  4096 estoura depois de 1–2 resultados de tool. `llm_test.py` usa
+  `num_ctx: 8192`; no `ollmcp`, ajustar o contexto do modelo também.
+- Sem GPU, o LLM ao lado da simulação leva minutos por rodada de tool
+  calling: funcional, mas impraticável para uso interativo.
+
+
+--------------------------------------------------------------------------------
+title: "Categories"
+url: https://blazemorales.github.io/rover_circ_ares/categories/index.md
+--------------------------------------------------------------------------------
+<no value>
+
+--------------------------------------------------------------------------------
+title: "Tags"
+url: https://blazemorales.github.io/rover_circ_ares/tags/index.md
+--------------------------------------------------------------------------------
+<no value>
